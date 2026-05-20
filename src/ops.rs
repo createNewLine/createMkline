@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 /// Recursively copy a file or directory.
 pub fn copy_entry(src: &Path, dst: &Path) -> Result<(), String> {
@@ -112,75 +113,126 @@ pub fn backup_one(src: &Path) -> Result<String, String> {
 }
 
 /// Execute the confirm operation for all sources.
-/// For each source: validate → copy to target → delete source → create link.
-/// On copy or delete error, all copied destinations are cleaned up.
+/// Phase 1: validate all sources (sequential, fast).
+/// Phase 2: copy all sources → target (parallel, the heavy part).
+/// Phase 3: delete sources + create links (parallel, fast).
+/// On any error, all copied destinations are cleaned up.
 pub fn execute_confirm(sources: &[String], target: &str) -> Result<String, String> {
     let target_dir = Path::new(target);
-    let mut copied: Vec<PathBuf> = Vec::new();
+    let total = sources.len();
 
+    // ── Phase 1: Validate all sources ──────────────────────────────
+    let mut plans: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(total);
     for (i, src_str) in sources.iter().enumerate() {
         let src_path = Path::new(src_str);
-
         if !src_path.exists() {
-            rollback(&copied);
             return Err(format!(
                 "[{}/{}] 源路径不存在: '{}'",
                 i + 1,
-                sources.len(),
+                total,
                 src_path.display()
             ));
         }
-
         let name = src_path.file_name().ok_or_else(|| {
-            rollback(&copied);
             format!(
                 "[{}/{}] 无效的源路径: '{}'",
                 i + 1,
-                sources.len(),
+                total,
                 src_path.display()
             )
         })?;
         let dst_path = target_dir.join(name);
-
         if dst_path.exists() {
-            rollback(&copied);
             return Err(format!(
                 "[{}/{}] 目标路径已存在: '{}'",
                 i + 1,
-                sources.len(),
+                total,
                 dst_path.display()
             ));
         }
-
-        // Step 1: copy source → target
-        if let Err(e) = copy_entry(src_path, &dst_path) {
-            let _ = remove_entry(&dst_path); // partial copy cleanup
-            rollback(&copied);
-            return Err(format!("[{}/{}] {}", i + 1, sources.len(), e));
+        if plans.iter().any(|(_, d)| d == &dst_path) {
+            return Err(format!(
+                "[{}/{}] 目标路径冲突: '{}'",
+                i + 1,
+                total,
+                dst_path.display()
+            ));
         }
-        copied.push(dst_path.clone());
-
-        // Step 2: delete source
-        if let Err(e) = remove_entry(src_path) {
-            rollback(&copied);
-            return Err(format!("[{}/{}] {}", i + 1, sources.len(), e));
-        }
-
-        // Step 3: create junction / symlink at original source location
-        if let Err(e) = create_link(src_path, &dst_path) {
-            // Data is safe in target; rollback is not possible for already-deleted sources.
-            // Clean up what we can and report the error.
-            rollback(&copied);
-            return Err(format!("[{}/{}] {}", i + 1, sources.len(), e));
-        }
+        plans.push((src_path.to_path_buf(), dst_path));
     }
 
-    Ok(format!("成功处理 {} 个源", sources.len()))
-}
+    // ── Phase 2: Copy all in parallel ──────────────────────────────
+    let copied: Arc<Mutex<Vec<(PathBuf, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+    let copy_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-/// Delete all paths in the list (best-effort cleanup).
-fn rollback(paths: &[PathBuf]) {
-    for p in paths {
-        let _ = remove_entry(p);
+    std::thread::scope(|s| {
+        for (idx, (src, dst)) in plans.iter().enumerate() {
+            let copied = Arc::clone(&copied);
+            let copy_errors = Arc::clone(&copy_errors);
+            s.spawn(move || {
+                match copy_entry(src, dst) {
+                    Ok(()) => {
+                        copied.lock().unwrap().push((src.clone(), dst.clone()));
+                    }
+                    Err(e) => {
+                        let _ = remove_entry(dst);
+                        copy_errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("[{}/{}] {}", idx + 1, total, e));
+                    }
+                }
+            });
+        }
+    });
+
+    let copy_errors = Arc::try_unwrap(copy_errors).unwrap().into_inner().unwrap();
+    if !copy_errors.is_empty() {
+        let copied = Arc::try_unwrap(copied).unwrap().into_inner().unwrap();
+        for (_, dst) in &copied {
+            let _ = remove_entry(dst);
+        }
+        return Err(copy_errors.join("\n"));
     }
+
+    let copied = Arc::try_unwrap(copied).unwrap().into_inner().unwrap();
+
+    // ── Phase 3: Delete sources + create links in parallel ────────
+    let link_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    std::thread::scope(|s| {
+        for (src, dst) in &copied {
+            let link_errors = Arc::clone(&link_errors);
+            s.spawn(move || {
+                if let Err(e) = remove_entry(src) {
+                    link_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("删除源失败 '{}': {}", src.display(), e));
+                    return;
+                }
+                if let Err(e) = create_link(src, dst) {
+                    link_errors
+                        .lock()
+                        .unwrap()
+                        .push(format!(
+                            "创建链接失败 '{}' -> '{}': {}",
+                            src.display(),
+                            dst.display(),
+                            e
+                        ));
+                }
+            });
+        }
+    });
+
+    let link_errors = Arc::try_unwrap(link_errors).unwrap().into_inner().unwrap();
+    if !link_errors.is_empty() {
+        for (_, dst) in &copied {
+            let _ = remove_entry(dst);
+        }
+        return Err(link_errors.join("\n"));
+    }
+
+    Ok(format!("成功处理 {} 个源", total))
 }

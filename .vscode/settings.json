@@ -1,0 +1,11 @@
+{
+    "rust-analyzer.server.extraEnv": {
+        "RUSTUP_HOME": "F:\\codeTools\\rust\\rustup",
+        "CARGO_HOME": "F:\\codeTools\\rust\\cargo",
+        "PATH": "F:\\codeTools\\rust\\mingw64\\mingw64\\bin;F:\\codeTools\\rust\\cargo\\bin;${env:PATH}"
+    },
+    "rust-analyzer.cargo.extraEnv": {
+        "RUSTUP_HOME": "F:\\codeTools\\rust\\rustup",
+        "CARGO_HOME": "F:\\codeTools\\rust\\cargo"
+    }
+}
