@@ -9,7 +9,7 @@ use iced::{
     widget::{button, column, image, row, scrollable, text, text_input, Space},
     window, Application, Color, Command, Element, Font, Length, Settings, Theme,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 fn main() -> iced::Result {
@@ -84,6 +84,7 @@ enum Message {
     // Async outcomes
     ConfirmResult(Result<String, String>),
     BackupResult(Result<String, String>),
+    Noop,
 }
 
 // ── Application impl ───────────────────────────────────────────────
@@ -173,13 +174,74 @@ impl Application for MkLineExe {
                     return Command::none();
                 }
 
-                let mut iter = paths.into_iter();
+                // Filter out duplicate names
+                let existing_names: Vec<String> = self
+                    .sources
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, s)| *idx != i && !s.trim().is_empty())
+                    .filter_map(|(_, s)| {
+                        Path::new(s)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect();
+
+                let mut seen: Vec<String> = Vec::new();
+                let mut duplicates: Vec<String> = Vec::new();
+                let mut valid_paths: Vec<String> = Vec::new();
+
+                for path in paths {
+                    let name = Path::new(&path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
+                    if let Some(ref name) = name {
+                        if existing_names.contains(name) || seen.contains(name) {
+                            duplicates.push(name.clone());
+                            continue;
+                        }
+                        seen.push(name.clone());
+                        valid_paths.push(path);
+                    } else {
+                        valid_paths.push(path);
+                    }
+                }
+
+                let cmd = if !duplicates.is_empty() {
+                    let msg = duplicates
+                        .iter()
+                        .map(|n| format!("{} 重复", n))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                rfd::MessageDialog::new()
+                                    .set_title("提示")
+                                    .set_description(&msg)
+                                    .show();
+                            })
+                            .await
+                            .ok();
+                        },
+                        |_| Message::Noop,
+                    )
+                } else {
+                    Command::none()
+                };
+
+                if valid_paths.is_empty() {
+                    return cmd;
+                }
+
+                let mut iter = valid_paths.into_iter();
                 self.sources[i] = iter.next().unwrap();
 
                 let filled = self.sources.iter().filter(|s| !s.trim().is_empty()).count();
                 let mut slots_left = 10usize.saturating_sub(filled);
 
-                // Existing empty rows (skip i, already set)
                 for idx in 0..self.sources.len() {
                     if slots_left == 0 {
                         break;
@@ -195,7 +257,6 @@ impl Application for MkLineExe {
                     }
                 }
 
-                // Add new rows for overflow
                 while slots_left > 0 {
                     if let Some(p) = iter.next() {
                         self.sources.push(p);
@@ -204,7 +265,7 @@ impl Application for MkLineExe {
                         break;
                     }
                 }
-                Command::none()
+                cmd
             }
 
             // ── Target ────────────────────────────────────────────
@@ -257,13 +318,77 @@ impl Application for MkLineExe {
                     return Command::none();
                 }
 
+                let duplicates = find_duplicates(&sources);
+                if !duplicates.is_empty() {
+                    let msg = duplicates
+                        .iter()
+                        .map(|n| format!("{} 重复", n))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.status = Status::Error;
+                    self.status_message = msg.clone();
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                rfd::MessageDialog::new()
+                                    .set_title("提示")
+                                    .set_description(&msg)
+                                    .show();
+                            })
+                            .await
+                            .ok();
+                        },
+                        |_| Message::Noop,
+                    );
+                }
+
                 self.status = Status::Running;
                 self.status_message = "正在处理...".into();
 
                 Command::perform(
                     async move {
+                        // Check target directory for name collisions
+                        let target_dir = PathBuf::from(&target);
+                        let mut collisions: Vec<String> = Vec::new();
+                        for src in &sources {
+                            if let Some(name) = Path::new(src).file_name() {
+                                let dst = target_dir.join(name);
+                                if dst.exists() {
+                                    if let Some(n) = name.to_str() {
+                                        collisions.push(n.to_string());
+                                    }
+                                }
+                            }
+                        }
+
+                        let overwrite = if !collisions.is_empty() {
+                            let msg = format!(
+                                "目标目录已有[{}],是否继续迁移并覆盖",
+                                collisions.join(", ")
+                            );
+                            let proceed = tokio::task::spawn_blocking(move || {
+                                matches!(
+                                    rfd::MessageDialog::new()
+                                        .set_title("提示")
+                                        .set_description(&msg)
+                                        .set_buttons(rfd::MessageButtons::OkCancel)
+                                        .show(),
+                                    rfd::MessageDialogResult::Ok
+                                )
+                            })
+                            .await
+                            .unwrap_or(false);
+
+                            if !proceed {
+                                return Err("已取消".to_string());
+                            }
+                            true
+                        } else {
+                            false
+                        };
+
                         tokio::task::spawn_blocking(move || {
-                            ops::execute_confirm(&sources, &target)
+                            ops::execute_confirm(&sources, &target, overwrite)
                         })
                         .await
                         .unwrap_or_else(|e| Err(format!("线程错误: {}", e)))
@@ -301,27 +426,99 @@ impl Application for MkLineExe {
                     return Command::none();
                 }
 
+                // Check for duplicate source paths
+                let mut seen_paths: Vec<&str> = Vec::new();
+                let mut dup_paths = false;
+                for s in &sources {
+                    if seen_paths.contains(&s.as_str()) {
+                        dup_paths = true;
+                        break;
+                    }
+                    seen_paths.push(s.as_str());
+                }
+                if dup_paths {
+                    self.status = Status::Error;
+                    self.status_message = "源路径重复".into();
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                rfd::MessageDialog::new()
+                                    .set_title("提示")
+                                    .set_description("源路径重复")
+                                    .show();
+                            })
+                            .await
+                            .ok();
+                        },
+                        |_| Message::Noop,
+                    );
+                }
+
                 self.status = Status::Running;
                 self.status_message = "正在备份...".into();
 
                 Command::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || {
-                            let results: Vec<String> = sources
-                                .iter()
-                                .map(|src| match ops::backup_one(Path::new(src)) {
-                                    Ok(path) => format!("✓ {}", path),
-                                    Err(e) => format!("✗ {}", e),
+                        // Phase 1: parallel validation
+                        let validate_handles: Vec<_> = sources
+                            .iter()
+                            .enumerate()
+                            .map(|(i, src)| {
+                                let src = src.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    (i, ops::backup_validate(Path::new(&src)))
                                 })
-                                .collect();
-                            if results.iter().all(|r| r.starts_with('✓')) {
-                                Ok(results.join("\n"))
-                            } else {
-                                Err(results.join("\n"))
+                            })
+                            .collect();
+
+                        let mut plans: Vec<(String, PathBuf)> =
+                            Vec::with_capacity(sources.len());
+                        for handle in validate_handles {
+                            match handle.await {
+                                Ok((i, Ok(path))) => {
+                                    if plans.iter().any(|(_, p)| p == &path) {
+                                        return Err(format!(
+                                            "备份路径冲突: '{}'",
+                                            path.display()
+                                        ));
+                                    }
+                                    plans.push((sources[i].clone(), path));
+                                }
+                                Ok((_, Err(e))) => return Err(e),
+                                Err(e) => return Err(format!("线程错误: {}", e)),
                             }
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(format!("线程错误: {}", e)))
+                        }
+
+                        // Phase 2: parallel copy
+                        let copy_handles: Vec<_> = plans
+                            .iter()
+                            .map(|(src, backup_path)| {
+                                let src = src.clone();
+                                let backup_path = backup_path.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    ops::backup_copy(Path::new(&src), &backup_path)
+                                        .map(|()| {
+                                            format!("✓ {}", backup_path.display())
+                                        })
+                                        .map_err(|e| format!("✗ {}", e))
+                                })
+                            })
+                            .collect();
+
+                        let mut results = Vec::new();
+                        for handle in copy_handles {
+                            match handle.await {
+                                Ok(Ok(s)) => results.push(s),
+                                Ok(Err(e)) => results.push(format!("✗ {}", e)),
+                                Err(e) => results.push(format!("✗ 线程错误: {}", e)),
+                            }
+                        }
+
+                        if results.iter().all(|r| r.starts_with('✓')) {
+                            Ok(results.join("\n"))
+                        } else {
+                            Err(results.join("\n"))
+                        }
                     },
                     Message::BackupResult,
                 )
@@ -339,6 +536,8 @@ impl Application for MkLineExe {
             }
 
             // ── Clear ─────────────────────────────────────────────
+            Message::Noop => Command::none(),
+
             Message::ClearAll => {
                 if self.status == Status::Running {
                     return Command::none();
@@ -390,9 +589,10 @@ impl Application for MkLineExe {
             })
             .collect();
 
+        let filled = self.sources.iter().filter(|s| !s.trim().is_empty()).count();
         let can_add = !running && self.sources.len() < 10;
         let add_btn = button(
-            text("+ 添加源")
+            text(format!("+ 添加源({}/10)", filled))
                 .horizontal_alignment(alignment::Horizontal::Center)
                 .size(FONT_SIZE),
         )
@@ -609,4 +809,24 @@ fn target_input(
         .spacing(3)
         .align_items(iced::Alignment::Center)
         .into()
+}
+
+fn find_duplicates(sources: &[String]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for s in sources {
+        if s.trim().is_empty() {
+            continue;
+        }
+        if let Some(name) = Path::new(s).file_name().and_then(|n| n.to_str()) {
+            if seen.contains(&name) {
+                if !duplicates.iter().any(|d| d == name) {
+                    duplicates.push(name.to_string());
+                }
+            } else {
+                seen.push(name);
+            }
+        }
+    }
+    duplicates
 }

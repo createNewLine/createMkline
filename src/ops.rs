@@ -1,6 +1,6 @@
 use std::fs;
+use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 /// Recursively copy a file or directory.
@@ -40,60 +40,19 @@ pub fn remove_entry(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Create a directory junction on Windows (mklink /J — no admin required).
-fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
-    let output = Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            "/J",
-            &link.to_string_lossy(),
-            &target.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| format!("执行 mklink 命令失败: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("创建目录联接失败: {}", stderr));
-    }
-    Ok(())
-}
-
-/// Create a file symbolic link on Windows (mklink — may require admin / developer mode).
-fn create_file_symlink(link: &Path, target: &Path) -> Result<(), String> {
-    let output = Command::new("cmd")
-        .args([
-            "/c",
-            "mklink",
-            &link.to_string_lossy(),
-            &target.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| format!("执行 mklink 命令失败: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "创建文件符号链接失败: {}\n提示: 可能需要启用开发者模式或以管理员身份运行",
-            stderr
-        ));
-    }
-    Ok(())
-}
-
 /// Create a symlink (junction for dirs, symlink for files) at `link` pointing to `target`.
 pub fn create_link(link: &Path, target: &Path) -> Result<(), String> {
-    // Determine if the target is a directory by checking the actual filesystem.
     if target.is_dir() {
-        create_junction(link, target)
+        junction::create(target, link)
+            .map_err(|e| format!("创建目录联接失败 '{}' -> '{}': {}", link.display(), target.display(), e))
     } else {
-        create_file_symlink(link, target)
+        symlink_file(target, link)
+            .map_err(|e| format!("创建文件符号链接失败 '{}' -> '{}': {}\n提示: 可能需要启用开发者模式或以管理员身份运行", link.display(), target.display(), e))
     }
 }
 
-/// Backup a single source: copy to `<parent>/<name>(1)`.
-pub fn backup_one(src: &Path) -> Result<String, String> {
+/// Validate backup preconditions. Returns the backup path to use.
+pub fn backup_validate(src: &Path) -> Result<PathBuf, String> {
     let parent = src
         .parent()
         .ok_or_else(|| format!("无法获取父目录: '{}'", src.display()))?;
@@ -108,8 +67,12 @@ pub fn backup_one(src: &Path) -> Result<String, String> {
         return Err(format!("备份路径已存在: '{}'", backup_path.display()));
     }
 
-    copy_entry(src, &backup_path)?;
-    Ok(backup_path.display().to_string())
+    Ok(backup_path)
+}
+
+/// Copy source to backup path.
+pub fn backup_copy(src: &Path, backup_path: &Path) -> Result<(), String> {
+    copy_entry(src, backup_path)
 }
 
 /// Execute the confirm operation for all sources.
@@ -117,7 +80,8 @@ pub fn backup_one(src: &Path) -> Result<String, String> {
 /// Phase 2: copy all sources → target (parallel, the heavy part).
 /// Phase 3: delete sources + create links (parallel, fast).
 /// On any error, all copied destinations are cleaned up.
-pub fn execute_confirm(sources: &[String], target: &str) -> Result<String, String> {
+/// If `overwrite` is true, existing paths in the target are removed before copying.
+pub fn execute_confirm(sources: &[String], target: &str, overwrite: bool) -> Result<String, String> {
     let target_dir = Path::new(target);
     let total = sources.len();
 
@@ -142,7 +106,7 @@ pub fn execute_confirm(sources: &[String], target: &str) -> Result<String, Strin
             )
         })?;
         let dst_path = target_dir.join(name);
-        if dst_path.exists() {
+        if !overwrite && dst_path.exists() {
             return Err(format!(
                 "[{}/{}] 目标路径已存在: '{}'",
                 i + 1,
@@ -170,6 +134,9 @@ pub fn execute_confirm(sources: &[String], target: &str) -> Result<String, Strin
             let copied = Arc::clone(&copied);
             let copy_errors = Arc::clone(&copy_errors);
             s.spawn(move || {
+                if overwrite && dst.exists() {
+                    let _ = remove_entry(dst);
+                }
                 match copy_entry(src, dst) {
                     Ok(()) => {
                         copied.lock().unwrap().push((src.clone(), dst.clone()));
@@ -198,40 +165,56 @@ pub fn execute_confirm(sources: &[String], target: &str) -> Result<String, Strin
     let copied = Arc::try_unwrap(copied).unwrap().into_inner().unwrap();
 
     // ── Phase 3: Delete sources + create links in parallel ────────
-    let link_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let results: Arc<Mutex<Vec<(bool, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     std::thread::scope(|s| {
         for (src, dst) in &copied {
-            let link_errors = Arc::clone(&link_errors);
+            let results = Arc::clone(&results);
+            let errors = Arc::clone(&errors);
             s.spawn(move || {
-                if let Err(e) = remove_entry(src) {
-                    link_errors
+                if let Err(e) = trash::delete(src) {
+                    errors
                         .lock()
                         .unwrap()
-                        .push(format!("删除源失败 '{}': {}", src.display(), e));
+                        .push(format!("删除源到回收站失败 '{}': {}", src.display(), e));
+                    results.lock().unwrap().push((false, dst.clone()));
                     return;
                 }
                 if let Err(e) = create_link(src, dst) {
-                    link_errors
-                        .lock()
-                        .unwrap()
-                        .push(format!(
-                            "创建链接失败 '{}' -> '{}': {}",
+                    if let Err(e2) = copy_entry(dst, src) {
+                        errors.lock().unwrap().push(format!(
+                            "创建链接失败且恢复失败 '{}' -> '{}': {} / {}",
+                            src.display(),
+                            dst.display(),
+                            e,
+                            e2
+                        ));
+                    } else {
+                        errors.lock().unwrap().push(format!(
+                            "创建链接失败 '{}' -> '{}': {} (源已恢复)",
                             src.display(),
                             dst.display(),
                             e
                         ));
+                    }
+                    results.lock().unwrap().push((false, dst.clone()));
+                    return;
                 }
+                results.lock().unwrap().push((true, dst.clone()));
             });
         }
     });
 
-    let link_errors = Arc::try_unwrap(link_errors).unwrap().into_inner().unwrap();
-    if !link_errors.is_empty() {
-        for (_, dst) in &copied {
-            let _ = remove_entry(dst);
+    let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    let errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
+    if !errors.is_empty() {
+        for (success, dst) in &results {
+            if !success {
+                let _ = remove_entry(dst);
+            }
         }
-        return Err(link_errors.join("\n"));
+        return Err(errors.join("\n"));
     }
 
     Ok(format!("成功处理 {} 个源", total))
