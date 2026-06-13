@@ -1,8 +1,8 @@
 use iced::widget::image;
 use resvg::usvg::TreeParsing;
 
-const FOLDER_SVG: &str = include_str!("svg/文件夹.svg");
-const DELETE_SVG: &str = include_str!("svg/删除.svg");
+const FOLDER_SVG: &str = include_str!("../svg/文件夹.svg");
+const DELETE_SVG: &str = include_str!("../svg/删除.svg");
 
 const ICON_SIZE: u32 = 36;
 
