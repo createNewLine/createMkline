@@ -342,6 +342,31 @@ impl Application for MkLineExe {
                     );
                 }
 
+                let symlinks = check_symlinks(&sources);
+                if !symlinks.is_empty() {
+                    let msg = symlinks
+                        .iter()
+                        .map(|s| format!("{}", Path::new(s).display()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let full_msg = format!("{}\n是软连接不可迁移", msg);
+                    self.status = Status::Error;
+                    self.status_message = full_msg.clone();
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                rfd::MessageDialog::new()
+                                    .set_title("提示")
+                                    .set_description(&full_msg)
+                                    .show();
+                            })
+                            .await
+                            .ok();
+                        },
+                        |_| Message::Noop,
+                    );
+                }
+
                 self.status = Status::Running;
                 self.status_message = "正在处理...".into();
 
@@ -445,6 +470,31 @@ impl Application for MkLineExe {
                                 rfd::MessageDialog::new()
                                     .set_title("提示")
                                     .set_description("源路径重复")
+                                    .show();
+                            })
+                            .await
+                            .ok();
+                        },
+                        |_| Message::Noop,
+                    );
+                }
+
+                let symlinks = check_symlinks(&sources);
+                if !symlinks.is_empty() {
+                    let msg = symlinks
+                        .iter()
+                        .map(|s| format!("{}", Path::new(s).display()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let full_msg = format!("{}\n是软连接不可迁移", msg);
+                    self.status = Status::Error;
+                    self.status_message = full_msg.clone();
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                rfd::MessageDialog::new()
+                                    .set_title("提示")
+                                    .set_description(&full_msg)
                                     .show();
                             })
                             .await
@@ -829,4 +879,19 @@ fn find_duplicates(sources: &[String]) -> Vec<String> {
         }
     }
     duplicates
+}
+
+fn check_symlinks(sources: &[String]) -> Vec<String> {
+    let mut symlinks = Vec::new();
+    for s in sources {
+        if s.trim().is_empty() {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(s) {
+            if meta.file_type().is_symlink() {
+                symlinks.push(s.clone());
+            }
+        }
+    }
+    symlinks
 }

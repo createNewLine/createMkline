@@ -29,13 +29,18 @@ pub fn copy_entry(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Recursively remove a file or directory.
+/// Uses `remove_dir_all` crate which calls Windows API directly (no shell process,
+/// safe from AV false positives) and handles readonly attributes internally.
 pub fn remove_entry(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
     if path.is_dir() {
-        fs::remove_dir_all(path)
-            .map_err(|e| format!("删除目录失败 '{}': {}", path.display(), e))?;
+        remove_dir_all::remove_dir_all(path)
+            .map_err(|e| format!("强制删除目录失败 '{}': {}", path.display(), e))?;
     } else {
         fs::remove_file(path)
-            .map_err(|e| format!("删除文件失败 '{}': {}", path.display(), e))?;
+            .map_err(|e| format!("强制删除文件失败 '{}': {}", path.display(), e))?;
     }
     Ok(())
 }
@@ -174,12 +179,19 @@ pub fn execute_confirm(sources: &[String], target: &str, overwrite: bool) -> Res
             let errors = Arc::clone(&errors);
             s.spawn(move || {
                 if let Err(e) = trash::delete(src) {
-                    errors
-                        .lock()
-                        .unwrap()
-                        .push(format!("删除源到回收站失败 '{}': {}", src.display(), e));
-                    results.lock().unwrap().push((false, dst.clone()));
-                    return;
+                    if let Err(e2) = remove_entry(src) {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!(
+                                "删除源失败（回收站和强制删除均失败）'{}': 回收站={}, 强制删除={}",
+                                src.display(),
+                                e,
+                                e2
+                            ));
+                        results.lock().unwrap().push((false, dst.clone()));
+                        return;
+                    }
                 }
                 if let Err(e) = create_link(src, dst) {
                     if let Err(e2) = copy_entry(dst, src) {
